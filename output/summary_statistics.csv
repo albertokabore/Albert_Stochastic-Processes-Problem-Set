@@ -1,0 +1,2 @@
+,n_obs,last_price,ann_mean_return,ann_volatility,skew,excess_kurtosis,adf_pvalue_price,adf_pvalue_returns,jarque_bera_stat,jarque_bera_pvalue,ljung_box_stat_lag10,ljung_box_pvalue_lag10
+TSLA,2358,219.91000366210932,0.2898248344965807,0.5528774987429469,-0.15923562032191263,4.801261317217765,0.6283725083293684,2.4773007865608947e-27,2261.8742690016143,0.0,302.8585678820558,3.8661001972648663e-59

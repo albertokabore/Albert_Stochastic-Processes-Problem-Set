@@ -23,7 +23,9 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy import stats as spstats
 from statsmodels.regression.linear_model import OLS
+from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tools import add_constant
 from statsmodels.tsa.stattools import adfuller
 
@@ -40,35 +42,26 @@ for _d in (DATA_DIR, FIGURES_DIR, OUTPUT_DIR):
 # 1. Data collection & preprocessing
 # --------------------------------------------------------------------------- #
 
-def fetch_price_history(ticker: str, period: str = "2y", use_cache: bool = True) -> pd.DataFrame:
+KAGGLE_DATASET = "jillanisofttech/tesla-stock-price"
+KAGGLE_RAW_FILE = DATA_DIR / "kaggle_raw" / "Tasla_Stock_Updated_V2.csv"
+
+
+def load_tesla_price_history(csv_path: Path = KAGGLE_RAW_FILE) -> pd.DataFrame:
     """
-    Download daily OHLCV history for `ticker` via yfinance, adjusted for
-    splits/dividends. Falls back to (and refreshes) a local CSV cache in
-    data/ so the notebook remains runnable offline / when the API rate-limits.
+    Load daily OHLCV history for Tesla (TSLA) from the Kaggle dataset
+    "jillanisofttech/tesla-stock-price" (downloaded via `kagglehub` and
+    committed to data/kaggle_raw/ for reproducibility). Covers 2015-01-02
+    through 2024-01-16, split-adjusted -- well beyond the assignment's
+    one-year minimum. This is the sole data source used in this project;
+    no data is fetched from any other API.
     """
-    cache_path = DATA_DIR / f"{ticker}.csv"
-
-    if use_cache and cache_path.exists():
-        cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-    else:
-        cached = None
-
-    try:
-        import yfinance as yf
-
-        df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        if df.empty:
-            raise ValueError("empty download")
-        df.index.name = "Date"
-        df.to_csv(cache_path)
-        return df
-    except Exception as exc:  # network / rate-limit failure -> use cache
-        if cached is not None:
-            print(f"[warn] live download for {ticker} failed ({exc}); using cached data/{ticker}.csv")
-            return cached
-        raise RuntimeError(f"Could not fetch {ticker} and no cache is available") from exc
+    df = pd.read_csv(csv_path)
+    unnamed = [c for c in df.columns if c.startswith("Unnamed")]
+    if unnamed:
+        df = df.drop(columns=unnamed)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    return df
 
 
 def clean_price_series(df: pd.DataFrame) -> pd.DataFrame:
@@ -102,10 +95,27 @@ def log_returns(close: pd.Series) -> pd.Series:
 
 
 def summary_statistics(close: pd.Series) -> dict:
-    """Annualized descriptive & stationarity statistics for a price series."""
+    """
+    Annualized descriptive, distributional, and stationarity statistics for a
+    price series. Two formal hypothesis tests supplement the descriptive
+    skew/kurtosis numbers:
+      - Jarque-Bera (scipy.stats.jarque_bera) tests H0: returns are Normally
+        distributed, using sample skewness and kurtosis jointly. A low
+        p-value is direct statistical evidence (not just visual/descriptive)
+        that GBM's Normal-return assumption is violated -- motivating the
+        jump-diffusion model.
+      - Ljung-Box on squared returns (statsmodels.stats.diagnostic) tests
+        H0: no autocorrelation in squared returns. A low p-value indicates
+        volatility clustering (ARCH effects): large moves tend to be
+        followed by large moves. None of GBM, OU, or MJD -- all of which
+        draw i.i.d. increments each step -- can reproduce this, which is
+        flagged explicitly as a shared limitation in the interpretation.
+    """
     r = log_returns(close)
     adf_price = adfuller(close.dropna())
     adf_ret = adfuller(r)
+    jb_stat, jb_pvalue = spstats.jarque_bera(r)
+    lb = acorr_ljungbox(r ** 2, lags=[10], return_df=True)
     return {
         "n_obs": int(len(close)),
         "start": close.index.min(),
@@ -119,6 +129,72 @@ def summary_statistics(close: pd.Series) -> dict:
         "adf_pvalue_price": float(adf_price[1]),
         "adf_stat_returns": float(adf_ret[0]),
         "adf_pvalue_returns": float(adf_ret[1]),
+        "jarque_bera_stat": float(jb_stat),
+        "jarque_bera_pvalue": float(jb_pvalue),
+        "ljung_box_stat_lag10": float(lb["lb_stat"].iloc[0]),
+        "ljung_box_pvalue_lag10": float(lb["lb_pvalue"].iloc[0]),
+    }
+
+
+def gbm_analytic_confidence_interval(S0: float, params: "GBMParams", n_steps: int,
+                                      dt: float = 1 / TRADING_DAYS_PER_YEAR,
+                                      conf: float = 0.90) -> tuple[float, float, float]:
+    """
+    Closed-form (analytic) confidence interval for GBM's terminal price,
+    derived from the exact log-normal distribution of S_t rather than Monte
+    Carlo sampling: log(S_t) ~ Normal(log(S0) + (mu - sigma^2/2)t, sigma^2*t).
+    Used as an independent cross-check that the Monte Carlo simulator
+    (`simulate_gbm`) is implemented correctly -- the empirical MC percentiles
+    should closely match these analytic percentiles for a large n_sims.
+
+    Returns (lower, median, upper) at the given confidence level.
+    """
+    t = n_steps * dt
+    mean_log = np.log(S0) + (params.mu - 0.5 * params.sigma ** 2) * t
+    std_log = params.sigma * np.sqrt(t)
+    alpha = 1 - conf
+    lower = float(np.exp(spstats.norm.ppf(alpha / 2, mean_log, std_log)))
+    median = float(np.exp(mean_log))
+    upper = float(np.exp(spstats.norm.ppf(1 - alpha / 2, mean_log, std_log)))
+    return lower, median, upper
+
+
+def backtest_model(close: pd.Series, holdout_days: int, calibrate_fn, simulate_fn,
+                    n_sims: int = 1000, seed: int = 42) -> dict:
+    """
+    Out-of-sample validation: fit a model on all data up to `holdout_days`
+    before the end of the series, simulate `holdout_days` forward, and check
+    where the price actually realized over the holdout period falls within
+    the simulated distribution. A well-calibrated model should place the
+    realized outcome near the middle of its distribution (percentile rank
+    well inside [5, 95]) more often than not; a percentile rank near 0 or 100
+    is evidence the model over- or under-estimated risk for that period.
+
+    Returns the realized terminal price, its percentile rank among the
+    simulated terminal prices, and whether it fell inside the model's own
+    90% confidence interval.
+    """
+    train = close.iloc[:-holdout_days]
+    actual_path = close.iloc[-holdout_days - 1:]
+    S0 = float(train.iloc[-1])
+    actual_terminal = float(actual_path.iloc[-1])
+
+    params = calibrate_fn(train)
+    rng = np.random.default_rng(seed)
+    paths = simulate_fn(S0, params, holdout_days, n_sims, rng=rng)
+    terminal = paths[:, -1]
+
+    percentile_rank = float((terminal < actual_terminal).mean() * 100)
+    p05, p95 = np.percentile(terminal, [5, 95])
+    return {
+        "train_end": train.index[-1],
+        "S0": S0,
+        "actual_terminal": actual_terminal,
+        "sim_mean_terminal": float(terminal.mean()),
+        "sim_p05": float(p05),
+        "sim_p95": float(p95),
+        "percentile_rank_of_actual": percentile_rank,
+        "inside_90pct_interval": bool(p05 <= actual_terminal <= p95),
     }
 
 
@@ -274,14 +350,20 @@ def path_statistics(paths: np.ndarray, S0: float) -> dict:
     """Terminal-value risk/return statistics for a Monte Carlo path array."""
     terminal = paths[:, -1]
     ret = terminal / S0 - 1
+    var95 = float(-np.percentile(ret, 5) * 100)
+    mean_return_pct = float(ret.mean() * 100)
     return {
         "mean_terminal": float(terminal.mean()),
         "median_terminal": float(np.median(terminal)),
         "std_terminal": float(terminal.std(ddof=1)),
         "p05_terminal": float(np.percentile(terminal, 5)),
         "p95_terminal": float(np.percentile(terminal, 95)),
-        "mean_return_pct": float(ret.mean() * 100),
+        "mean_return_pct": mean_return_pct,
         "prob_loss_pct": float((terminal < S0).mean() * 100),
-        "VaR_95_pct": float(-np.percentile(ret, 5) * 100),  # 95% 1-horizon Value at Risk
+        "VaR_95_pct": var95,  # 95% 1-horizon Value at Risk
         "CVaR_95_pct": float(-ret[ret <= np.percentile(ret, 5)].mean() * 100),
+        # Return-to-risk ratio: expected return per unit of downside tail risk (VaR).
+        # Higher is better; lets investors compare models/horizons on a risk-adjusted basis
+        # rather than on expected return alone.
+        "return_to_VaR_ratio": float(mean_return_pct / var95) if var95 > 0 else float("nan"),
     }
